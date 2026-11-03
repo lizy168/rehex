@@ -53,15 +53,19 @@ REHex::CodeAnalyser::CodeAnalyser(Document *doc, BitOffset offset, BitOffset len
 	m_longest_instruction = 0;
 	m_longest_disasm = 0;
 	
+	m_fences = accumulate_fences();
+	
 	dirty.set_range(0, m_data_length);
 	
 	m_task = wxGetApp().thread_pool->queue_task([this]() { return analyse_chunk(); }, 1);
 	
 	wxGetApp().settings->Bind(PREFERRED_ASM_SYNTAX_CHANGED, &REHex::CodeAnalyser::OnPreferredAsmSyntaxChanged, this);
+	doc->Bind(EV_COMMENT_MODIFIED, &REHex::CodeAnalyser::OnDocumentCommentsChanged, this);
 }
 
 REHex::CodeAnalyser::~CodeAnalyser()
 {
+	doc->Unbind(EV_COMMENT_MODIFIED, &REHex::CodeAnalyser::OnDocumentCommentsChanged, this);
 	wxGetApp().settings->Unbind(PREFERRED_ASM_SYNTAX_CHANGED, &REHex::CodeAnalyser::OnPreferredAsmSyntaxChanged, this);
 	
 	m_task.finish();
@@ -116,6 +120,15 @@ void REHex::CodeAnalyser::rebase(BitOffset offset)
 {
 	assert(m_task.paused());
 	m_base_offset = offset;
+	
+	std::vector<off_t> new_fences = accumulate_fences();
+	if(new_fences != m_fences)
+	{
+		m_fences = std::move(new_fences);
+		refresh(m_base_offset, m_data_length);
+		
+		instructions.clear();
+	}
 }
 
 bool REHex::CodeAnalyser::analyse_chunk()
@@ -140,6 +153,16 @@ bool REHex::CodeAnalyser::analyse_chunk()
 	
 	off_t remain_after = m_data_length - (process_base + process_len);
 	assert(remain_after >= 0);
+	
+	/* Clamp process_len and remain_after to the next fence point. */
+	auto next_fence = std::upper_bound(m_fences.begin(), m_fences.end(), process_base);
+	if(next_fence != m_fences.end())
+	{
+		process_len = std::min(process_len, (*next_fence - process_base));
+		
+		remain_after = std::min(m_data_length, *next_fence) - (process_base + process_len);
+		assert(remain_after >= 0);
+	}
 	
 	off_t process_extra = std::min<off_t>(128, remain_after);
 	
@@ -506,6 +529,104 @@ void REHex::CodeAnalyser::OnPreferredAsmSyntaxChanged(wxCommandEvent &event)
 		pause();
 		refresh(m_base_offset, m_data_length);
 		resume();
+		
+		/* Clear cached instructions. */
+		instructions.clear();
+	}
+	
+	event.Skip(); /* Continue propagation. */
+}
+
+std::vector<off_t> REHex::CodeAnalyser::accumulate_fences()
+{
+	std::vector<off_t> fences;
+	
+	BitOffset data_end = m_base_offset + BitOffset(m_data_length, 0);
+	
+	std::function<void(const BitRangeTree<Document::Comment>::Node*)> walk;
+	walk = [&](const BitRangeTree<Document::Comment>::Node *n)
+	{
+		if(n->key.offset >= m_base_offset && n->key.offset < data_end
+			&& (n->get_parent() == NULL || n->get_parent()->key.offset < n->key.offset))
+		{
+			BitOffset o = n->key.offset - m_base_offset;
+			if(o.byte_aligned() && (fences.empty() || fences.back() != o.byte()))
+			{
+				assert(fences.empty() || fences.back() < o.byte());
+				fences.push_back(o.byte());
+			}
+		}
+		
+		{
+			const BitRangeTree<Document::Comment>::Node *m = n->get_first_child();
+			
+			/* TODO: Better search to find first applicable node. */
+			while(m != NULL && (m->key.offset + m->key.length) < m_base_offset)
+			{
+				m = m->get_next();
+			}
+			
+			while(m != NULL && m->key.offset < data_end)
+			{
+				walk(m);
+				m = m->get_next();
+			}
+		}
+		
+		if(n->key.length > BitOffset::ZERO)
+		{
+			BitOffset n_end = n->key.offset + n->key.length;
+			if(n_end >= m_base_offset && n_end < data_end
+				&& (n->get_parent() == NULL || (n->get_parent()->key.offset + n->get_parent()->key.length) > n_end))
+			{
+				BitOffset o = n_end - m_base_offset;
+				if(o.byte_aligned())
+				{
+					assert(fences.empty() || fences.back() < o.byte());
+					fences.push_back(o.byte());
+				}
+			}
+		}
+	};
+	
+	const BitRangeTree<Document::Comment> &comments = doc->get_comments();
+	const BitRangeTree<Document::Comment>::Node *n = comments.first_root_node();
+	
+	/* TODO: Better search to find first applicable node. */
+	while(n != NULL && (n->key.offset + n->key.length) < m_base_offset)
+	{
+		n = n->get_next();
+	}
+	
+	while(n != NULL && n->key.offset < (m_base_offset + BitOffset(m_data_length, 0)))
+	{
+		walk(n);
+		n = n->get_next();
+	}
+	
+	return fences;
+}
+
+void REHex::CodeAnalyser::OnDocumentCommentsChanged(wxCommandEvent &event)
+{
+	std::vector<off_t> new_fences = accumulate_fences();
+	
+	if(new_fences != m_fences)
+	{
+		bool paused = m_task.paused();
+		
+		if(!paused)
+		{
+			pause();
+		}
+		
+		m_fences = std::move(new_fences);
+		refresh(m_base_offset, m_data_length);
+		
+		if(!paused)
+		{
+			resume();
+		}
 		
 		/* Clear cached instructions. */
 		instructions.clear();
